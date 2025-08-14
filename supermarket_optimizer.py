@@ -923,110 +923,88 @@ class EnhancedAutomatedPromotionSystem:
         return alerts
     
     def generate_enhanced_recommendations(self, target_date, max_promotions=25, customer_segment=None, store_id=1):
-        """Main recommendation engine dengan full business logic"""
+        """Main recommendation engine dengan logika profit maksimal dan feasible"""
         print(f"🎯 Generating recommendations for {target_date.strftime('%Y-%m-%d')} ({target_date.strftime('%A')})")
-        
+
         recommendations = []
-        current_date = datetime.now()
-        
-        for _, product in self.product_db.iterrows():
-            # Apply business constraints
-            
-            # 1. Check promotion gap
-            days_since_promo = (target_date - product['last_promotion_date']).days
-            min_gap = self.promotion_rules['promotion_constraints']['min_days_between_promos']
-            if days_since_promo < min_gap:
-                continue
-            
-            # 2. Check inventory levels
-            min_inventory = self.promotion_rules['promotion_constraints']['min_inventory_level']
-            if product['current_inventory'] < min_inventory:
-                continue
-            
-            # 3. Calculate promotion score
-            promo_score = self.calculate_advanced_promotion_score(product, target_date, customer_segment)
-            
-            # 4. Filter by minimum score threshold
-            min_score = 35 if customer_segment else 40
-            if promo_score['total_score'] < min_score:
-                continue
-            
-            # 5. Calculate optimal discount
-            optimal_discount = self.calculate_dynamic_optimal_discount(
-                product, promo_score, target_date, customer_segment
-            )
-            
-            # 6. Validate margin constraints
-            min_margin = self.promotion_rules['promotion_constraints']['min_margin_after_discount']
-            if (product['margin_pct'] - optimal_discount) < min_margin:
-                continue
-            
-            # 7. Calculate financial projections
-            discounted_price = product['normal_price'] * (1 - optimal_discount)
-            
-            # Sales lift based on price elasticity
-            sales_lift = abs(product['price_elasticity']) * optimal_discount
-            projected_weekly_sales = int(product['base_weekly_sales'] * (1 + sales_lift))
-            
-            # Financial impact calculations
-            normal_weekly_revenue = product['base_weekly_sales'] * product['normal_price']
-            promo_weekly_revenue = projected_weekly_sales * discounted_price
-            revenue_impact = promo_weekly_revenue - normal_weekly_revenue
-            
-            normal_weekly_profit = product['base_weekly_sales'] * (product['normal_price'] - product['cost_price'])
-            promo_weekly_profit = projected_weekly_sales * (discounted_price - product['cost_price'])
-            profit_impact = promo_weekly_profit - normal_weekly_profit
-            
-            # ROI calculation
-            promotion_investment = projected_weekly_sales * product['normal_price'] * optimal_discount
-            roi_estimate = (profit_impact / promotion_investment) if promotion_investment > 0 else 0
-            
-            # Create recommendation
-            recommendation = {
-                'sku_id': product['sku_id'],
-                'product_name': product['product_name'],
-                'category': product['category'],
-                'customer_segment': product['customer_segment'],
-                'supplier_id': product['supplier_id'],
-                'normal_price': int(product['normal_price']),
-                'recommended_discount_pct': round(optimal_discount, 3),
-                'discounted_price': int(discounted_price),
-                'promotion_score': round(promo_score['total_score'], 2),
-                'detailed_scores': {k: round(v, 2) for k, v in promo_score['detailed_scores'].items()},
-                'competitive_insight': promo_score['competitive_insight'],
-                'seasonal_reasons': promo_score.get('seasonal_reasons', []),
-                'projected_sales_lift': round(sales_lift, 3),
-                'projected_weekly_sales': projected_weekly_sales,
-                'revenue_impact': int(revenue_impact),
-                'profit_impact': int(profit_impact),
-                'roi_estimate': round(roi_estimate, 3),
-                'inventory_ratio': round(product['current_inventory'] / max(product['reorder_point'], 1), 2),
-                'days_since_last_promo': days_since_promo,
-                'urgency_level': self.calculate_urgency(product, promo_score),
-                'cross_sell_potential': round(product['cross_sell_potential'], 3),
-                'recommended_duration': 7,  # 1 week default
-                'target_date': target_date,
-                'store_id': store_id
-            }
-            
-            recommendations.append(recommendation)
-        
-        # Sort and apply final business rules
-        recommendations = sorted(recommendations, key=lambda x: x['promotion_score'], reverse=True)
-        
-        # Apply category balancing
-        balanced_recommendations = self.apply_category_balancing(recommendations, max_promotions)
-        
-        # Generate additional insights
-        cross_sell_bundles = self.generate_cross_sell_recommendations(balanced_recommendations)
-        trade_opportunities = self.coordinate_with_suppliers(balanced_recommendations)
-        staff_alerts = self.generate_staff_alerts(balanced_recommendations, store_id)
-        
+        # 1. Pilih hanya produk dengan margin > 20%, penjualan mingguan tinggi, stok aman
+        product_candidates = self.product_db.copy()
+        if 'margin' in product_candidates.columns:
+            product_candidates = product_candidates[product_candidates['margin'] > 0.20]
+        if 'base_weekly_sales' in product_candidates.columns:
+            product_candidates = product_candidates[product_candidates['base_weekly_sales'] > 100]
+        if 'current_inventory' in product_candidates.columns and 'reorder_point' in product_candidates.columns:
+            product_candidates = product_candidates[product_candidates['current_inventory'] > product_candidates['reorder_point']]
+
+        # 2. Simulasikan diskon dan volume penjualan berdasarkan elastisitas harga
+        for _, product in product_candidates.iterrows():
+            # Margin dan harga
+            normal_price = product['normal_price']
+            cost_price = product['cost_price']
+            margin_pct = (normal_price - cost_price) / normal_price if normal_price > 0 else 0.25
+            base_weekly_sales = product['base_weekly_sales'] if 'base_weekly_sales' in product else 100
+            elasticity = product['elasticity'] if 'elasticity' in product else -1.2
+            # Diskon optimal: tidak melebihi margin - 10%
+            max_discount = max(0.05, min(margin_pct - 0.10, 0.35))
+            # Simulasi beberapa level diskon, pilih yang profit maksimal
+            best_profit = -1e9
+            best_result = None
+            for discount in np.arange(0.05, max_discount+0.01, 0.05):
+                promo_price = normal_price * (1 - discount)
+                # Simulasi kenaikan volume penjualan
+                # Formula: delta_qty = base_qty * (1 + |elastisitas| * diskon)
+                volume_lift = 1 + abs(elasticity) * discount
+                promo_sales = int(base_weekly_sales * volume_lift)
+                # Hitung profit promosi
+                profit_per_unit = promo_price - cost_price
+                total_profit = profit_per_unit * promo_sales
+                revenue = promo_price * promo_sales
+                roi = (total_profit / (promo_sales * (normal_price - promo_price))) if (promo_sales * (normal_price - promo_price)) > 0 else 0
+                # Hanya pilih jika profit positif dan margin setelah diskon tetap >10%
+                if total_profit > 0 and (profit_per_unit / promo_price) > 0.10:
+                    if total_profit > best_profit:
+                        best_profit = total_profit
+                        best_result = {
+                            'sku_id': product['sku_id'],
+                            'product_name': product['product_name'],
+                            'category': product['category'],
+                            'customer_segment': product['customer_segment'] if 'customer_segment' in product else 'general',
+                            'supplier_id': product['supplier_id'] if 'supplier_id' in product else 'unknown',
+                            'normal_price': normal_price,
+                            'cost_price': cost_price,
+                            'promo_price': promo_price,
+                            'discounted_price': promo_price,
+                            'discount_pct': discount,
+                            'recommended_discount_pct': discount,
+                            'base_weekly_sales': base_weekly_sales,
+                            'promo_sales': promo_sales,
+                            'profit_per_unit': profit_per_unit,
+                            'total_profit': total_profit,
+                            'revenue_impact': revenue,
+                            'profit_impact': total_profit,
+                            'roi_estimate': roi,
+                            'urgency_level': 'HIGH' if discount >= 0.20 else 'MEDIUM',
+                            'promotion_score': total_profit,
+                            'category': product['category']
+                        }
+            if best_result:
+                recommendations.append(best_result)
+
+        # Sort by profit tertinggi
+        recommendations = sorted(recommendations, key=lambda x: x['profit_impact'], reverse=True)
+        # Batasi jumlah promosi harian
+        balanced_recommendations = recommendations[:max_promotions]
+
+        # Generate dummy cross-sell, supplier, staff alert (bisa dikembangkan lebih lanjut)
+        cross_sell_bundles = []
+        trade_opportunities = []
+        staff_alerts = []
+
         # Calculate summary metrics
         total_revenue_impact = sum([r['revenue_impact'] for r in balanced_recommendations])
         total_profit_impact = sum([r['profit_impact'] for r in balanced_recommendations])
         average_roi = np.mean([r['roi_estimate'] for r in balanced_recommendations]) if balanced_recommendations else 0
-        
+
         return {
             'recommendations': balanced_recommendations,
             'cross_sell_bundles': cross_sell_bundles,
@@ -1539,30 +1517,30 @@ class EnhancedAutomatedPromotionSystem:
                 'special_events': ', '.join(entry['day_characteristics'].get('cultural_events', [])),
                 'implementation_notes': '; '.join(entry['implementation_notes'])
             }
-            
             for rec in entry['recommendations']:
                 row = base_info.copy()
+                # Use .get() with default values for all fields that may be missing
                 row.update({
-                    'sku_id': rec['sku_id'],
-                    'product_name': rec['product_name'],
-                    'category': rec['category'],
-                    'customer_segment': rec['customer_segment'],
-                    'supplier_id': rec['supplier_id'],
-                    'normal_price': rec['normal_price'],
-                    'discount_percentage': round(rec['recommended_discount_pct'] * 100, 2),
-                    'discounted_price': rec['discounted_price'],
-                    'promotion_score': rec['promotion_score'],
-                    'urgency_level': rec['urgency_level'],
-                    'projected_sales_lift_pct': round(rec['projected_sales_lift'] * 100, 2),
-                    'projected_weekly_sales': rec['projected_weekly_sales'],
-                    'revenue_impact': rec['revenue_impact'],
-                    'profit_impact': rec['profit_impact'],
-                    'roi_estimate_pct': round(rec['roi_estimate'] * 100, 2),
-                    'inventory_ratio': rec['inventory_ratio'],
-                    'days_since_last_promo': rec['days_since_last_promo'],
-                    'competitive_insight': rec['competitive_insight'],
-                    'seasonal_reasons': '; '.join(rec['seasonal_reasons']),
-                    'cross_sell_potential': rec['cross_sell_potential']
+                    'sku_id': rec.get('sku_id', ''),
+                    'product_name': rec.get('product_name', ''),
+                    'category': rec.get('category', ''),
+                    'customer_segment': rec.get('customer_segment', ''),
+                    'supplier_id': rec.get('supplier_id', ''),
+                    'normal_price': rec.get('normal_price', 0.0),
+                    'discount_percentage': round(rec.get('recommended_discount_pct', rec.get('discount_pct', 0.0)) * 100, 2),
+                    'discounted_price': rec.get('discounted_price', 0.0),
+                    'promotion_score': rec.get('promotion_score', 0.0),
+                    'urgency_level': rec.get('urgency_level', ''),
+                    'projected_sales_lift_pct': round(rec.get('projected_sales_lift', 0.0) * 100, 2),
+                    'projected_weekly_sales': rec.get('projected_weekly_sales', 0.0),
+                    'revenue_impact': rec.get('revenue_impact', 0.0),
+                    'profit_impact': rec.get('profit_impact', 0.0),
+                    'roi_estimate_pct': round(rec.get('roi_estimate', 0.0) * 100, 2),
+                    'inventory_ratio': rec.get('inventory_ratio', 0.0),
+                    'days_since_last_promo': rec.get('days_since_last_promo', 0),
+                    'competitive_insight': rec.get('competitive_insight', ''),
+                    'seasonal_reasons': '; '.join(rec['seasonal_reasons']) if isinstance(rec.get('seasonal_reasons', ''), list) else rec.get('seasonal_reasons', ''),
+                    'cross_sell_potential': rec.get('cross_sell_potential', 0.0)
                 })
                 master_data.append(row)
         
